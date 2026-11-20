@@ -58,6 +58,10 @@ _VIDEO_META_KEYS = (
 )
 
 
+class NoVideoAvailable(RuntimeError):
+    """O proxy não expõe nenhum vídeo (post só com imagem, por exemplo)."""
+
+
 @dataclass
 class Media:
     video_url: str
@@ -207,7 +211,7 @@ def resolve_media(url: str) -> Media:
     response.raise_for_status()
     direct = _og_video(response.text, response.url)
     if not direct:
-        raise RuntimeError(f"og:video não encontrado em {host}")
+        raise NoVideoAvailable(f"og:video não encontrado em {host}")
     return Media(direct, _og_title(response.text), host)
 
 
