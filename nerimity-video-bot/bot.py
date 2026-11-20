@@ -66,12 +66,27 @@ def normalize_url(url: str) -> str:
     return embed_download.to_original_url(url)
 
 
+def build_caption(message_id: int | str | None, original_url: str) -> str:
+    """Cita a mensagem que continha o vídeo; usa a URL se não houver ID."""
+    if message_id:
+        return f"[q:{message_id}]"
+    return f"[{original_url}]({original_url})"
+
+
 def is_instagram_link(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return any(
         host == domain or host.endswith("." + domain)
         for domain in ("instagram.com", "oginstagram.com")
     )
+
+
+def is_image_url(url: str) -> bool:
+    """Detecta links diretos de imagem, como anexos .jpg do Discord CDN."""
+    if not config.IGNORE_IMAGE_URLS:
+        return False
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in config.IMAGE_EXTENSIONS)
 
 
 def extract_urls(text: str) -> list[str]:
@@ -292,8 +307,9 @@ async def compress_until_fits(
 # --------------------------------------------------------------------------- #
 async def process_job(job: dict[str, Any]) -> None:
     url: str = job["url"]
-    original_url = normalize_url(url)  # link exibido na legenda (oginstagram -> instagram)
+    original_url = normalize_url(url)  # usado apenas se não houver ID da mensagem
     channel_id: int = job["channel_id"]
+    message_id = job.get("message_id")
     job_dir = Path(config.DOWNLOAD_DIR) / uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -350,8 +366,8 @@ async def process_job(job: dict[str, Any]) -> None:
             )
             return
 
-        # Legenda curta: apenas o link em Markdown, sem título/tamanho.
-        caption = f"[{original_url}]({original_url})"
+        # Legenda curta: cita a mensagem original; o vídeo vai como anexo.
+        caption = build_caption(message_id, original_url)
         await send_to_channel(channel_id, caption, final_file)
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -406,6 +422,7 @@ async def on_message_created(raw: Any) -> None:
         return
 
     channel_id = int(message.channel_id)
+    message_id = getattr(message, "id", None)
 
     for url in extract_urls(content):
         host = (urlparse(url).hostname or "").lower()
@@ -415,13 +432,18 @@ async def on_message_created(raw: Any) -> None:
             host.endswith(h) for h in config.ALLOWED_HOSTS
         ):
             continue
+        if is_image_url(url):
+            print(f"Ignorando imagem: {url}")
+            continue
 
         key = (url, channel_id)
         if key in in_flight:
             continue
         in_flight.add(key)
-        await queue.put({"url": url, "channel_id": channel_id})
-        print(f"Na fila: {url} (canal {channel_id})")
+        await queue.put(
+            {"url": url, "channel_id": channel_id, "message_id": message_id}
+        )
+        print(f"Na fila: {url} (canal {channel_id}, msg {message_id})")
 
 
 if __name__ == "__main__":
