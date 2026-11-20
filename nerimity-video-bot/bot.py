@@ -66,6 +66,14 @@ def normalize_url(url: str) -> str:
     return embed_download.to_original_url(url)
 
 
+def is_instagram_link(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in ("instagram.com", "oginstagram.com")
+    )
+
+
 def extract_urls(text: str) -> list[str]:
     urls: list[str] = []
     for raw in URL_RE.findall(text or ""):
@@ -304,10 +312,21 @@ async def process_job(job: dict[str, Any]) -> None:
         except Exception as exc:
             print(f"[proxy] falhou ({exc}); usando yt-dlp como fallback...")
             fallback_url = embed_download.to_original_url(url)
-            info = await asyncio.wait_for(
-                asyncio.to_thread(download_sync, fallback_url, output_template),
-                timeout=config.DOWNLOAD_TIMEOUT_S,
-            )
+            try:
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(download_sync, fallback_url, output_template),
+                    timeout=config.DOWNLOAD_TIMEOUT_S,
+                )
+            except Exception as fallback_exc:
+                print(f"[yt-dlp] falhou ({fallback_exc})")
+                # Aviso em inglês apenas para Instagram sem mídia baixável.
+                # Outros links continuam falhando silenciosamente no canal.
+                if is_instagram_link(url):
+                    await safe_send(
+                        channel_id,
+                        "⚠️ Unable to download media from this link.",
+                    )
+                return
 
         source = pick_downloaded_file(job_dir)
         if source is None:
