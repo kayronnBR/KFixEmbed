@@ -13,8 +13,9 @@ Exemplo de mensagem enviada pelo bot:
 ## ✨ Funcionalidades
 
 - Detecta automaticamente URLs em mensagens do Nerimity (`on_message_create`).
-- Baixa vídeos com `yt-dlp` (YouTube, TikTok, X, etc.).
-- Suporte especial a links **OGInstagram / Instagram**: download direto pelo `og:video`, contornando a falta de suporte do yt-dlp ao domínio `oginstagram.com`.
+- Baixa vídeos usando **proxys de fix embed**: lê o `og:video` da página corrigida (ou a API do FxTwitter) e puxa o MP4 direto, sem depender do site original.
+- Redes atendidas pelo proxy: **Instagram** (`oginstagram`), **X/Twitter** (`fxtwitter` API), **TikTok** (`tnktok`) e **Reddit** (`vxreddit`).
+- `yt-dlp` continua instalado como **fallback**: se o proxy falhar, o bot tenta o link original com ele.
 - Compactação progressiva com `ffmpeg` se o arquivo passar do limite:
   - 720p → 480p → 360p → 240p, reduzindo o bitrate a cada tentativa.
 - Envia o vídeo como anexo real no canal, usando a API atual do Nerimity.
@@ -117,50 +118,79 @@ Ou, usando o venv sem ativá-lo:
 
 Para rodar em segundo plano:
 
-```bater
+```bash
 nohup .venv/bin/python -u bot.py > bot.log 2>&1 &
 ```
 
-Saúde esperada na inicialização:
+Saída esperada na inicialização:
 
-```texto
+```text
 Logado como <seu_bot>. Limite: 50 MB
-1 trabalhador(es) iniciado(s).
-O bot agora está ouvindo as conexões recebidas.
+1 worker(s) iniciado(s).
+The bot is now listening to incoming connections.
 ```
 
-## 🧠 Como função
+## 🧠 Como funciona
 
-1. `on_message_create` URLs extras do conteúdo da mensagem.
-2. Ignora mensagens invejadas pelo preço bot e comandos que vêm com `ab!`.
+1. `on_message_create` extrai URLs do conteúdo da mensagem.
+2. Ignora mensagens enviadas pelo próprio bot e comandos que começam com `ab!`.
 3. Cada URL entra numa fila assíncrona.
-4. Ó trabalhador baixa o vídeo:
-   - `yt-dlp` para sites suportados;
-   - baixar direto fazer `og:vídeo` para links `oginstagram`.
-5. O arquivo é verificado com `sonda ff` para confirmar que contém vídeo e obter a duração.
-6. Se passar de `TARGET_MAX_MB * FATOR_DE SEGURANÇA`, o `ffmpeg` recompensa em tentativas progressivas.
+4. O worker baixa o vídeo:
+   - primeiro via proxy de fix embed (`og:video` / API do FxTwitter);
+   - se falhar, usa `yt-dlp` no domínio original como precaução.
+5. O arquivo é verificado com `ffprobe` para confirmar que contém vídeo e obter a duração.
+6. Se passar de `TARGET_MAX_MB * SAFETY_FACTOR`, o `ffmpeg` recompensa em tentativas progressivas.
 7. O bot envia o vídeo anexo com a legenda `[url](url)`.
-8. Uma massa temporária é removida ao final.
+8. A pasta temporária é removida ao final.
 
 ## 🔧 Notas técnicas
 
-- O upload usa uma API atual do Nerimity, não uma implementação antiga da lib `nerimidade`:
-  1. `POST/api/canais/{id}/cdn/token`
-  2. carregar binário em `https://cdn.nerimity.com/attachments/{id}` com `Autorização`, `Nome do arquivo` e `Tipo de conteúdo`
-  3. `POST/api/canais/{id}/mensagens` com `nerimityCdnFileId`
-- Canais privados podem exigir apoiador/moderador do Nerimity para anos.
-- Sites suportados dependem dos extratores do `yt-dlp`, exceto o atalho direto do OGInstagram.
+- O upload usa a API atual do Nerimity, não a implementação antiga da lib `nerimity`:
+  1. `POST /api/channels/{id}/cdn/token`
+  2. upload binário em `https://cdn.nerimity.com/attachments/{id}` com `Authorization`, `File-Name` e `Content-Type`
+  3. `POST /api/channels/{id}/messages` com `nerimityCdnFileId`
+- Canais privados podem exigir supporter/moderador do Nerimity para anexos.
+- Pelo proxy: Instagram, X/Twitter, TikTok e Reddit. Pelo fallback `yt-dlp`: qualquer site suportado pelo extractor dele (incluindo YouTube).
 
-## 🛠️ Resolução de problemas
+## 🛠️ Solução de problemas
 
 | Sintoma | Causa provável | Solução |
 |---|---|---|
-| `ERRO: defina NERIMITY_TOKEN` | `.ambiente` ausente ou vazio | Copiar `.exemplo env` parágrafo `.ambiente` e preencha |
-| `ERRO: ffmpeg não encontrado` | ffmpeg fora do `CAMINHO` | Instalar e reiniciar o terminal |
-| `falha ao gerar token CDN` | Token invadido ou sem permissão | Gere outro token sem Nerimity |
-| `não parece conter vídeo` | Link sem stream de vídeo | Use um link de vídeo |
-| `Não foi possível compactar...` | Arquivo grande demais mesmo no mínimo | Aumente `ALVO_MÁX.MB` ou use o vídeo menor |
+| `ERRO: defina NERIMITY_TOKEN` | `.env` ausente ou vazio | Copie `.env.example` para `.env` e preencha |
+| `ERRO: ffmpeg não encontrado` | ffmpeg fora do `PATH` | Instale e reinicie o terminal |
+| `falha ao gerar token CDN` | Token inválido ou sem permissão | Gere outro token no Nerimity |
+| `não parece conter vídeo` | Link sem stream de vídeo | Use um link de vídeo válido |
+| `Não foi possível compactar...` | Arquivo grande demais mesmo no mínimo | Aumente `TARGET_MAX_MB` ou use vídeo menor |
+
+## 📱 Rodando no Termux (Android)
+
+No celular, instale as dependências uma vez:
+
+```bash
+pkg update -y
+pkg install -y python ffmpeg tmux termux-api
+pip install -r requirements.txt
+```
+
+Copie a pasta do bot para `~/video-bot`, entre nela e configure o token:
+
+```bash
+cd ~/video-bot
+cp .env.example .env   # edite e cole seu token
+chmod 600 .env
+```
+
+Use os scripts inclusos:
+
+```bash
+./start.sh     # inicia em tmux (session "videobot") com wake-lock e auto-restart
+./stop.sh      # para o bot
+tail -f bot.log             # acompanha os logs
+tmux attach -t videobot     # abre a sessão ao vivo
+```
+
+> O `start.sh` usa `termux-wake-lock` para evitar que o Android suspenda o processo e reinicia o bot automaticamente se ele cair.
 
 ## 📄 Licença
 
-Use como quiser, nos termos do repositório. O `yt-dlp` e o `nerimidade` possuem suas proprias licenças.
+Use como quiser, nos termos do repositório. O `yt-dlp` e o `nerimity` possuem suas próprias licenças.
