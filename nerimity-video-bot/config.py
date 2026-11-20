@@ -48,3 +48,11 @@ FFMPEG_TIMEOUT_S = 600
 # Deixe vazio para aceitar qualquer site suportado pelo yt-dlp.
 ALLOWED_HOSTS: list[str] = []
 BLOCKED_HOSTS: list[str] = []
+
+# Links diretos de imagem são ignorados (ex.: anexos .jpg do Discord CDN).
+# Vídeos (.mp4, .webm, .mov, ...) continuam sendo processados normalmente.
+IGNORE_IMAGE_URLS = True
+IMAGE_EXTENSIONS: list[str] = [
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+    ".heic", ".heif", ".avif", ".tif", ".tiff",
+]
