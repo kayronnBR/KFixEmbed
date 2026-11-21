@@ -1,3 +1,5 @@
+
+
 """Bot Nerimity: detecta links de vídeo nas mensagens, baixa pelos proxys de
 fix embed (com yt-dlp como fallback), comprime com ffmpeg e reenvia no canal.
 
@@ -165,6 +167,45 @@ async def safe_send(channel_id: int, text: str) -> None:
         print(f"[erro ao avisar no canal {channel_id}]: {exc}")
 
 
+async def open_dm_channel(user_id: int | str, session: aiohttp.ClientSession) -> int:
+    """Abre (ou reaproveita) o canal de DM com o usuário e devolve o channelId."""
+    headers = {"Authorization": config.NERIMITY_TOKEN}
+    url = f"https://nerimity.com/api/users/{user_id}/open-channel"
+    async with session.post(url, headers=headers, json={}) as response:
+        data = await response.json(content_type=None)
+        channel_id = data.get("channelId") if isinstance(data, dict) else None
+        if response.status != 200 or not channel_id:
+            raise RuntimeError(f"falha ao abrir DM com {user_id}: {data}")
+        return int(channel_id)
+
+
+async def send_dm(user_id: int | str, text: str) -> None:
+    """Envia uma mensagem no privado (DM) do usuário."""
+    headers = {
+        "Authorization": config.NERIMITY_TOKEN,
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {"content": text, "buttons": []}
+    async with aiohttp.ClientSession() as session:
+        channel_id = await open_dm_channel(user_id, session)
+        url = f"https://nerimity.com/api/channels/{channel_id}/messages"
+        async with session.post(url, headers=headers, json=body) as response:
+            data = await response.json(content_type=None)
+            if response.status != 200:
+                raise RuntimeError(f"falha ao enviar DM para {user_id}: {data}")
+
+
+async def safe_send_dm(user_id: int | str | None, text: str) -> None:
+    """Envia no privado sem derrubar o job em caso de erro."""
+    if not user_id:
+        print("[aviso DM]: sem author_id no job; não foi possível enviar no privado")
+        return
+    try:
+        await send_dm(user_id, text)
+    except Exception as exc:
+        print(f"[erro ao avisar no privado de {user_id}]: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # download (yt-dlp) e compressão (ffmpeg)
 # --------------------------------------------------------------------------- #
@@ -310,6 +351,7 @@ async def process_job(job: dict[str, Any]) -> None:
     original_url = normalize_url(url)  # usado apenas se não houver ID da mensagem
     channel_id: int = job["channel_id"]
     message_id = job.get("message_id")
+    author_id = job.get("author_id")
     job_dir = Path(config.DOWNLOAD_DIR) / uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -335,12 +377,14 @@ async def process_job(job: dict[str, Any]) -> None:
                 )
             except Exception as fallback_exc:
                 print(f"[yt-dlp] falhou ({fallback_exc})")
-                # Aviso em inglês apenas para Instagram sem mídia baixável.
-                # Outros links continuam falhando silenciosamente no canal.
+                # Aviso apenas para Instagram sem mídia baixável: em vez de
+                # postar no canal, cita a mensagem original e avisa no privado
+                # de quem a enviou.
                 if is_instagram_link(url):
-                    await safe_send(
-                        channel_id,
-                        "⚠️ Unable to download media from this link.",
+                    quote = f"[q:{message_id}]" if message_id else f"[{original_url}]({original_url})"
+                    await safe_send_dm(
+                        author_id,
+                        f"{quote}\n⚠️ Unable to download media from this link.",
                     )
                 return
 
@@ -440,10 +484,16 @@ async def on_message_created(raw: Any) -> None:
         if key in in_flight:
             continue
         in_flight.add(key)
+        author_id = getattr(message, "author_id", None)
         await queue.put(
-            {"url": url, "channel_id": channel_id, "message_id": message_id}
+            {
+                "url": url,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "author_id": author_id,
+            }
         )
-        print(f"Na fila: {url} (canal {channel_id}, msg {message_id})")
+        print(f"Na fila: {url} (canal {channel_id}, msg {message_id}, autor {author_id})")
 
 
 if __name__ == "__main__":
