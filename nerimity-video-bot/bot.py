@@ -29,6 +29,26 @@ import embed_download
 
 URL_RE = re.compile(r"https?://[^\s<>\[\]()\"']+", re.IGNORECASE)
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".avif"}
+CONTENT_TYPES = {
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".m4v": "video/x-m4v",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".avif": "image/avif",
+}
+
+
+def content_type_of(path: Path) -> str:
+    return CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
 
 client = nerimity.Client(token=config.NERIMITY_TOKEN, prefix=config.COMMAND_PREFIX)
 queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -83,9 +103,41 @@ def is_instagram_link(url: str) -> bool:
     )
 
 
+def is_tiktok_link(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in ("tiktok.com", "tnktok.com")
+    )
+
+
+def is_reddit_link(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in (
+            "reddit.com",
+            "redd.it",
+            "vxreddit.com",
+            "i.redd.it",
+            "preview.redd.it",
+            "external-preview.redd.it",
+            "redditmedia.com",
+        )
+    )
+
+
+def is_image_social_link(url: str) -> bool:
+    """Redes com suporte a download de imagem: TikTok, Instagram e Reddit."""
+    return is_instagram_link(url) or is_tiktok_link(url) or is_reddit_link(url)
+
+
 def is_image_url(url: str) -> bool:
     """Detecta links diretos de imagem, como anexos .jpg do Discord CDN."""
     if not config.IGNORE_IMAGE_URLS:
+        return False
+    # Mídias do Reddit (i.redd.it etc.) devem ser processadas, não ignoradas.
+    if is_reddit_link(url):
         return False
     path = urlparse(url).path.lower()
     return any(path.endswith(ext) for ext in config.IMAGE_EXTENSIONS)
@@ -128,7 +180,7 @@ async def upload_to_cdn(
     headers = {
         "Authorization": token,
         "File-Name": quote(file_path.name),
-        "Content-Type": "video/mp4",
+        "Content-Type": content_type_of(file_path),
     }
     url = f"https://cdn.nerimity.com/attachments/{channel_id}"
     async with session.post(url, headers=headers, data=payload) as response:
@@ -346,6 +398,34 @@ async def compress_until_fits(
 # --------------------------------------------------------------------------- #
 # processamento dos jobs
 # --------------------------------------------------------------------------- #
+async def try_send_images(
+    url: str,
+    channel_id: int,
+    message_id: int | str | None,
+    job_dir: Path,
+) -> bool:
+    """Tenta baixar/enviar imagens. Apenas TikTok e Instagram são aceitos."""
+    if not is_image_social_link(url):
+        return False
+    try:
+        images = await asyncio.wait_for(
+            asyncio.to_thread(embed_download.download_images, url, str(job_dir)),
+            timeout=config.DOWNLOAD_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[imagem] falha ao processar {url}: {exc}")
+        return False
+
+    if not images:
+        return False
+
+    caption = build_caption(message_id, normalize_url(url))
+    for image in images:
+        await send_to_channel(channel_id, caption, image)
+    print(f"[imagem] {len(images)} imagem(ns) enviada(s) de {url}")
+    return True
+
+
 async def process_job(job: dict[str, Any]) -> None:
     url: str = job["url"]
     original_url = normalize_url(url)  # usado apenas se não houver ID da mensagem
@@ -358,8 +438,15 @@ async def process_job(job: dict[str, Any]) -> None:
     output_template = str(job_dir / "source.%(ext)s")
 
     try:
+        # 0) Posts de imagem do TikTok/Instagram são resolvidos antes do vídeo.
+        #    Se o post tiver og:video, resolve_images() devolve [] e o fluxo
+        #    normal de vídeo continua responsável por ele.
+        if await try_send_images(url, channel_id, message_id, job_dir):
+            return
+
         # 1) tenta baixar pelo proxy de fix embed (og:video / API do FxTwitter);
         # 2) se falhar, usa o yt-dlp como precaução no domínio original.
+        info: dict[str, Any] | None = None
         try:
             info = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -377,11 +464,17 @@ async def process_job(job: dict[str, Any]) -> None:
                 )
             except Exception as fallback_exc:
                 print(f"[yt-dlp] falhou ({fallback_exc})")
-                # Aviso apenas para Instagram sem mídia baixável: em vez de
-                # postar no canal, cita a mensagem original e avisa no privado
-                # de quem a enviou.
-                if is_instagram_link(url):
-                    quote = f"[q:{message_id}]" if message_id else f"[{original_url}]({original_url})"
+                # Última tentativa: o proxy pode ter imagens que o og:video
+                # não expôs (carrosséis, por exemplo).
+                if await try_send_images(url, channel_id, message_id, job_dir):
+                    return
+                # Avisa apenas no privado; não posta falha no canal.
+                if is_image_social_link(url):
+                    quote = (
+                        f"[q:{message_id}]"
+                        if message_id
+                        else f"[{original_url}]({original_url})"
+                    )
                     await safe_send_dm(
                         author_id,
                         f"{quote}\n⚠️ Unable to download media from this link.",
@@ -390,15 +483,20 @@ async def process_job(job: dict[str, Any]) -> None:
 
         source = pick_downloaded_file(job_dir)
         if source is None:
-            await safe_send(channel_id, f"❌ Não foi possível baixar o vídeo: {url}")
+            if await try_send_images(url, channel_id, message_id, job_dir):
+                return
+            await safe_send(channel_id, f"❌ Não foi possível baixar a mídia: {url}")
             return
 
         probed_duration, has_video = await probe_media(source)
         if not has_video:
+            # Arquivo baixado não é vídeo: pode ser uma imagem direta do post.
+            if await try_send_images(url, channel_id, message_id, job_dir):
+                return
             await safe_send(channel_id, f"⚠️ O link não parece conter vídeo: {url}")
             return
 
-        duration = info.get("duration") or probed_duration
+        duration = (info or {}).get("duration") or probed_duration
         final_file, attempts = await compress_until_fits(source, job_dir, duration)
 
         if final_file is None:
@@ -498,4 +596,6 @@ async def on_message_created(raw: Any) -> None:
 
 if __name__ == "__main__":
     preflight()
-    client.run()
+    # restart_always=True evita que a lib encerre o processo após 2 falhas
+    # de handshake WebSocket em menos de 1 minuto (comum em rede instável).
+    client.run(restart_always=True)
