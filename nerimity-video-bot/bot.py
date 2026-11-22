@@ -27,6 +27,24 @@ import yt_dlp
 import config
 import embed_download
 
+# A versao instalada da lib nerimity tem um bug em Embed.__init__: a linha
+# `self.style` (solta, sem atribuicao) estoura AttributeError ao deserializar
+# QUALQUER mensagem com embed/htmlEmbed, derrubando o bot inteiro.
+# Corrigimos por monkeypatch na carga do modulo (sobrevive a pip install -U).
+from nerimity.embed import Embed as _Embed
+from nerimity._enums import EmbedTypes as _EmbedTypes
+
+
+def _embed_init_fixed(self, data: str = "", type: int = _EmbedTypes.HTML, **kw) -> None:
+    self.type = type
+    self.style = kw.get("style")
+    self.body = kw.get("body") or (
+        _Embed._decode(data) if type == _EmbedTypes.HTML and data else data
+    )
+
+
+_Embed.__init__ = _embed_init_fixed
+
 URL_RE = re.compile(r"https?://[^\s<>\[\]()\"']+", re.IGNORECASE)
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".avif"}
@@ -52,8 +70,9 @@ def content_type_of(path: Path) -> str:
 
 client = nerimity.Client(token=config.NERIMITY_TOKEN, prefix=config.COMMAND_PREFIX)
 queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+_queue_loop = None
 in_flight: set[tuple[str, int]] = set()
-_workers_started = False
+_workers: list[asyncio.Task] = []
 
 
 # --------------------------------------------------------------------------- #
@@ -538,14 +557,29 @@ async def worker(name: int) -> None:
 # --------------------------------------------------------------------------- #
 @client.listen("on_ready")
 async def on_ready(client_info: dict) -> None:
-    global _workers_started
+    global queue, _queue_loop, _workers
     account = getattr(client.account, "username", "?")
     print(f"Logado como {account}. Limite: {config.TARGET_MAX_MB:.0f} MB")
 
-    if not _workers_started:
-        _workers_started = True
+    loop = asyncio.get_running_loop()
+    if _queue_loop is not loop:
+        # O restart_always da lib roda asyncio.run(main()) de novo a cada
+        # crash, criando um event loop NOVO. A Queue antiga fica presa ao
+        # loop morto (get() estoura "bound to a different event loop") e as
+        # tasks dos workers morrem com ele. Recriamos os dois aqui.
+        for tarefa in _workers:
+            if not tarefa.done():
+                try:
+                    tarefa.cancel()
+                except RuntimeError:
+                    pass
+        queue = asyncio.Queue()
+        _queue_loop = loop
+        _workers = []
         for index in range(config.MAX_CONCURRENT_DOWNLOADS):
-            asyncio.create_task(worker(index), name=f"video-worker-{index}")
+            _workers.append(
+                asyncio.create_task(worker(index), name=f"video-worker-{index}")
+            )
         print(f"{config.MAX_CONCURRENT_DOWNLOADS} worker(s) iniciado(s).")
 
 
