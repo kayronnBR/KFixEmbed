@@ -98,11 +98,15 @@ Ajuste os limites em `config.py`:
 | `AUDIO_BITRATE_KBPS` | `96` | Bitrate de áudio na recompressão |
 | `MIN_VIDEO_BITRATE_KBPS` | `100` | Bitrate mínimo; abaixo disso o bot avisa que não coube |
 | `MAX_LINKS_PER_MESSAGE` | `3` | Máximo de links processados por mensagem |
-| `MAX_CONCURRENT_DOWNLOADS` | `1` | Downloads simultâneos (1 = sequencial) |
+| `MAX_CONCURRENT_DOWNLOADS` | `2` | Downloads simultâneos (um link travado não bloqueia a fila) |
 | `DOWNLOAD_DIR` | `downloads` | Pasta temporária (limpa automaticamente) |
-| `DOWNLOAD_TIMEOUT_S` | `300` | Timeout do download |
-| `FFMPEG_TIMEOUT_S` | `600` | Timeout de cada tentativa do ffmpeg |
+| `DOWNLOAD_TIMEOUT_S` | `120` | Timeout do proxy ou do `yt-dlp`, por tentativa |
+| `FFMPEG_TIMEOUT_S` | `240` | Timeout de cada tentativa do ffmpeg |
+| `UPLOAD_TIMEOUT_S` | `60` | Token CDN + upload + POST da mensagem |
+| `IMAGE_TIMEOUT_S` | `20` | Sondagem de imagem (links `/video/` pulam esta etapa) |
+| `JOB_TIMEOUT_S` | `300` | Limite total por job |
 | `ALLOWED_HOSTS` / `BLOCKED_HOSTS` | vazios | Filtros opcionais de domínio |
+| `IGNORE_IMAGE_URLS` / `IMAGE_EXTENSIONS` | `True` / jpg, png, etc. | Ignora links diretos de imagem (ex.: anexos do Discord CDN), sem afetar `.webm`/`.mp4` |
 
 ## ▶️ Executando
 
@@ -125,8 +129,8 @@ nohup .venv/bin/python -u bot.py > bot.log 2>&1 &
 Saída esperada na inicialização:
 
 ```text
-Logado como <seu_bot>. Limite: 50 MB
-1 worker(s) iniciado(s).
+[2026-11-26 20:00:10] Logado como <seu_bot>. Limite: 50 MB
+[2026-11-26 20:00:10] 2 worker(s) iniciado(s).
 The bot is now listening to incoming connections.
 ```
 
@@ -134,14 +138,15 @@ The bot is now listening to incoming connections.
 
 1. `on_message_create` extrai URLs do conteúdo da mensagem.
 2. Ignora mensagens enviadas pelo próprio bot e comandos que começam com `ab!`.
-3. Cada URL entra numa fila assíncrona.
-4. O worker baixa o vídeo:
+3. Ignora links de imagem (por extensão, ex.: `.jpg` do Discord CDN); vídeos continuam na fila.
+4. Cada URL entra numa fila assíncrona.
+5. O worker baixa o vídeo:
    - primeiro via proxy de fix embed (`og:video` / API do FxTwitter);
    - se falhar, usa `yt-dlp` no domínio original como precaução.
-5. O arquivo é verificado com `ffprobe` para confirmar que contém vídeo e obter a duração.
-6. Se passar de `TARGET_MAX_MB * SAFETY_FACTOR`, o `ffmpeg` recompensa em tentativas progressivas.
-7. O bot envia o vídeo anexo com a legenda `[url](url)`.
-8. A pasta temporária é removida ao final.
+6. O arquivo é verificado com `ffprobe` para confirmar que contém vídeo e obter a duração.
+7. Se passar de `TARGET_MAX_MB * SAFETY_FACTOR`, o `ffmpeg` recompensa em tentativas progressivas.
+8. O bot envia o vídeo anexo com a legenda `[q:id-da-mensagem]`, citando a mensagem onde o link foi postado (se o ID não estiver disponível, usa `[url](url)`).
+9. A pasta temporária é removida ao final.
 
 ## 🔧 Notas técnicas
 
@@ -151,6 +156,11 @@ The bot is now listening to incoming connections.
   3. `POST /api/channels/{id}/messages` com `nerimityCdnFileId`
 - Canais privados podem exigir supporter/moderador do Nerimity para anexos.
 - Pelo proxy: Instagram, X/Twitter, TikTok e Reddit. Pelo fallback `yt-dlp`: qualquer site suportado pelo extractor dele (incluindo YouTube).
+- Em Android/Termux a resolução IPv6 pode travar tanto o WebSocket quanto o
+  `requests` (o timeout dele não cobre DNS). O bot força `getaddrinfo` para
+  IPv4 e usa `open_timeout=60` no websocket, com reconexão com backoff.
+- Os logs de job incluem horário e duração de cada etapa (`[proxy]`,
+  `[yt-dlp]`, `[ffmpeg]`, `[job]`).
 
 ## 🛠️ Solução de problemas
 
@@ -161,6 +171,7 @@ The bot is now listening to incoming connections.
 | `falha ao gerar token CDN` | Token inválido ou sem permissão | Gere outro token no Nerimity |
 | `não parece conter vídeo` | Link sem stream de vídeo | Use um link de vídeo válido |
 | `Não foi possível compactar...` | Arquivo grande demais mesmo no mínimo | Aumente `TARGET_MAX_MB` ou use vídeo menor |
+| `Unable to download media from this link.` | Post do Instagram sem vídeo público (só imagem ou requer login) | Nada a fazer; use um link com vídeo público |
 
 ## 📱 Rodando no Termux (Android)
 

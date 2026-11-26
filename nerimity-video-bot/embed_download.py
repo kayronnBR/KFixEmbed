@@ -16,6 +16,8 @@ import hashlib
 import html
 import json
 import re
+import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,24 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
+# o timeout do requests não cobre resolução DNS; no Android o IPv6 trava.
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
+
 USER_AGENT = "Mozilla/5.0 (compatible; NerimityVideoBot/1.0)"
+
+# Timeouts enxutos: uma URL morta não pode prender a fila por minutos.
+CONNECT_TIMEOUT_S = 10
+READ_TIMEOUT_S = 30
+PAGE_TIMEOUT_S = 15
+MAX_IMAGE_DOWNLOAD_S = 30       # por imagem (timeout total do stream)
+MAX_MEDIA_DOWNLOAD_S = 90       # por vídeo (timeout total do stream)
 
 # site original -> proxy de embed usado como fonte do download
 PROXIES: dict[str, str] = {
@@ -184,7 +203,7 @@ def _get_proxy_page(proxy_url: str) -> tuple[str, str]:
         return cached
 
     response = requests.get(
-        proxy_url, headers={"User-Agent": USER_AGENT}, timeout=20
+        proxy_url, headers={"User-Agent": USER_AGENT}, timeout=PAGE_TIMEOUT_S
     )
     response.raise_for_status()
     result = (response.text, response.url)
@@ -352,21 +371,39 @@ def download_images(url: str, job_dir: str, max_images: int = 10) -> list[Path]:
     folder.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     seen: set[str] = set()
+    seen_urls: set[str] = set()
 
     for index, image_url in enumerate(image_urls, 1):
+        # Carrosséis repetem a mesma URL várias vezes: não gasta 30-60s
+        # baixando de novo só para descobrir que é duplicata.
+        if image_url in seen_urls:
+            print(f"[imagem] duplicata {index} descartada (URL repetida)")
+            continue
+        seen_urls.add(image_url)
+        started = time.monotonic()
         try:
             response = requests.get(
                 image_url,
                 stream=True,
-                timeout=(20, 60),
+                timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
                 headers={"User-Agent": USER_AGENT, "Referer": image_url},
             )
             response.raise_for_status()
-            data = b"".join(
-                chunk for chunk in response.iter_content(chunk_size=1 << 20) if chunk
+            chunks: list[bytes] = []
+            for chunk in response.iter_content(chunk_size=1 << 20):
+                if not chunk:
+                    continue
+                if time.monotonic() - started > MAX_IMAGE_DOWNLOAD_S:
+                    raise TimeoutError(
+                        f"download de imagem passou de {MAX_IMAGE_DOWNLOAD_S}s"
+                    )
+                chunks.append(chunk)
+            data = b"".join(chunks)
+        except (requests.RequestException, TimeoutError) as exc:
+            print(
+                f"[imagem] falha no download {index} em "
+                f"{time.monotonic() - started:.1f}s: {exc}"
             )
-        except requests.RequestException as exc:
-            print(f"[imagem] falha no download {index}: {exc}")
             continue
 
         ext = _image_ext_from_bytes(data)
@@ -406,7 +443,9 @@ def _resolve_twitter(url: str) -> Media:
         f"https://api.fxtwitter.com/status/{status_id}",
     ):
         try:
-            response = requests.get(endpoint, headers=headers, timeout=20)
+            response = requests.get(
+                endpoint, headers=headers, timeout=PAGE_TIMEOUT_S
+            )
             response.raise_for_status()
             data = response.json()
         except (requests.RequestException, json.JSONDecodeError):
@@ -478,10 +517,11 @@ def download_from_url(url: str, output_template: str) -> dict[str, Any]:
     media = resolve_media(url)
     print(f"[download] {media.source}: {media.video_url[:120]}")
 
+    started = time.monotonic()
     response = requests.get(
         media.video_url,
         stream=True,
-        timeout=(20, 120),
+        timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
         headers={"User-Agent": USER_AGENT, "Referer": media.video_url},
     )
     response.raise_for_status()
@@ -496,8 +536,15 @@ def download_from_url(url: str, output_template: str) -> dict[str, Any]:
     destination = Path(output_template.replace("%(ext)s", ext))
     with destination.open("wb") as file:
         for chunk in response.iter_content(chunk_size=1 << 20):
-            if chunk:
-                file.write(chunk)
+            if not chunk:
+                continue
+            if time.monotonic() - started > MAX_MEDIA_DOWNLOAD_S:
+                destination.unlink(missing_ok=True)
+                raise TimeoutError(
+                    f"download passou de {MAX_MEDIA_DOWNLOAD_S}s: {media.video_url[:120]}"
+                )
+            file.write(chunk)
+    print(f"[download] concluído em {time.monotonic() - started:.1f}s")
 
     return {
         "title": media.title,

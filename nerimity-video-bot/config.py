@@ -37,12 +37,16 @@ MIN_VIDEO_BITRATE_KBPS = 100  # bitrate mínimo de vídeo (se ainda passar do li
 
 # ---------------------------------------------------------------- fila / links
 MAX_LINKS_PER_MESSAGE = 3     # quantos links por mensagem são processados
-MAX_CONCURRENT_DOWNLOADS = 1  # downloads simultâneos (1 = sequencial, mais seguro)
+MAX_CONCURRENT_DOWNLOADS = 2  # 2 workers: um link travado não bloqueia a fila inteira
 DOWNLOAD_DIR = "downloads"    # pasta temporária (limpa após cada job)
 
 # ---------------------------------------------------------------- tempo (s)
-DOWNLOAD_TIMEOUT_S = 300
-FFMPEG_TIMEOUT_S = 600
+# Timeouts curtos: um link ruim não pode prender a fila por vários minutos.
+DOWNLOAD_TIMEOUT_S = 120      # proxy OU yt-dlp, por tentativa
+FFMPEG_TIMEOUT_S = 240        # por tentativa de compressão
+UPLOAD_TIMEOUT_S = 60         # token CDN + upload + POST da mensagem
+IMAGE_TIMEOUT_S = 20          # sondagem de imagem (posts de vídeo não devem pagar isso)
+JOB_TIMEOUT_S = 300           # limite total por job ( proxies + compressão )
 
 # ---------------------------------------------------------------- filtros
 # Deixe vazio para aceitar qualquer site suportado pelo yt-dlp.
